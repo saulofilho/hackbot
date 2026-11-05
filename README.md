@@ -1,5 +1,16 @@
 # hackbot
 
+<p align="center">
+  <img src="docs/og.png" alt="hackbot — phosphor CRT terminal: an LLM-orchestrated pentest harness (ReAct + LangGraph)." width="100%" />
+</p>
+
+<p align="center">
+  <a href="https://saulofilho.github.io/hackbot/">website</a> ·
+  <a href="#tutorial-your-first-run">tutorial</a> ·
+  <a href="#safety-model">safety model</a> ·
+  <a href="#cli-reference">cli</a>
+</p>
+
 **An LLM-orchestrated pentest harness (ReAct + LangGraph).**
 
 `hackbot` runs an autonomous agent loop where a language model dynamically decides
