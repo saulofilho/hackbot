@@ -384,7 +384,7 @@ export PH_OPENAI_API_KEY=sk-...
 
 ```bash
 export PH_LLM_PROVIDER=openai
-export PH_LLM_MODEL=glm-4
+export PH_LLM_MODEL=glm-4.6
 export PH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 export PH_OPENAI_API_KEY=...
 ```
@@ -395,6 +395,30 @@ export PH_OPENAI_API_KEY=...
 export PH_LLM_PROVIDER=anthropic
 export PH_LLM_MODEL=claude-3-5-sonnet-latest
 export PH_ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### fish shell
+
+If your shell is `fish`, use `set -x` instead of `export`. Each block below is
+self-contained (sets every variable it needs).
+
+```fish
+# DeepSeek
+set -x PH_LLM_PROVIDER openai
+set -x PH_LLM_MODEL deepseek-chat
+set -x PH_LLM_BASE_URL https://api.deepseek.com/v1
+set -x PH_OPENAI_API_KEY sk-...
+
+# GLM / Zhipu (OpenAI-compatible)
+set -x PH_LLM_PROVIDER openai
+set -x PH_LLM_MODEL glm-4.6
+set -x PH_LLM_BASE_URL https://open.bigmodel.cn/api/paas/v4
+set -x PH_OPENAI_API_KEY ...
+
+# Anthropic
+set -x PH_LLM_PROVIDER anthropic
+set -x PH_LLM_MODEL claude-3-5-sonnet-latest
+set -x PH_ANTHROPIC_API_KEY sk-ant-...
 ```
 
 ---
