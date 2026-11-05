@@ -1,0 +1,9 @@
+{
+  "allowed_hosts": ["localhost", "127.0.0.1", "juice-shop.lab"],
+  "allowed_cidrs": ["10.10.10.0/24"],
+  "allowed_paths": ["/*"],
+  "exclude_paths": ["/logout", "/admin/delete"],
+  "max_requests_per_second": 5.0,
+  "authorized_by": "seu-email@empresa.com",
+  "authorization_ref": "TICKET-SEC-123"
+}
