@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en" data-phosphor="green">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>hackbot // phosphor terminal</title>
+<meta name="description" content="hackbot — an LLM-orchestrated pentest harness (ReAct + LangGraph) with a hard scope guard, kill-switch budget, and dry-run-by-default safety." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #05070a;
+    --bg2: #080c0a;
+    --phos: #33ff8a;
+    --phos-dim: #1f7f4a;
+    --phos-glow: rgba(51, 255, 138, 0.55);
+    --amber: #ffb000;
+    --font-term: "Share Tech Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+    --font-pixel: "VT323", var(--font-term);
+    --line: rgba(51, 255, 138, 0.22);
+  }
+  :root[data-phosphor="amber"] {
+    --phos: #ffb33a;
+    --phos-dim: #9a6a14;
+    --phos-glow: rgba(255, 179, 58, 0.5);
+    --line: rgba(255, 179, 58, 0.22);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(130% 120% at 50% 0%, var(--bg2) 0%, var(--bg) 60%, #02030400 100%),
+      var(--bg);
+    color: var(--phos);
+    font-family: var(--font-term);
+    line-height: 1.55;
+    min-height: 100vh;
+    overflow-x: hidden;
+    text-shadow: 0 0 2px var(--phos-glow), 0 0 10px var(--phos-glow);
+    -webkit-font-smoothing: none;
+  }
+
+  /* ---- CRT overlays ---- */
+  .crt-scanlines, .crt-vignette, .crt-flicker {
+    position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+  }
+  .crt-scanlines {
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(0,0,0,0) 0px,
+      rgba(0,0,0,0) 2px,
+      rgba(0,0,0,0.28) 3px,
+      rgba(0,0,0,0.28) 4px
+    );
+    mix-blend-mode: multiply;
+  }
+  .crt-vignette {
+    background: radial-gradient(120% 120% at 50% 50%, transparent 55%, rgba(0,0,0,0.75) 100%);
+  }
+  .crt-flicker { background: var(--phos); opacity: 0; animation: flicker 6s infinite steps(1); mix-blend-mode: screen; }
+  @keyframes flicker {
+    0%,100%{opacity:0;} 2%{opacity:0.015;} 2.5%{opacity:0;}
+    40%{opacity:0;} 41%{opacity:0.02;} 41.4%{opacity:0;}
+    73%{opacity:0;} 73.6%{opacity:0.012;} 74%{opacity:0;}
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .crt-flicker { animation: none; }
+    .cursor { animation: none; }
+  }
+
+  /* ---- layout ---- */
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 16px 120px; position: relative; z-index: 1; }
+
+  /* ---- top bar ---- */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 50;
+    background: linear-gradient(to bottom, var(--bg) 70%, transparent);
+    flex-wrap: wrap;
+  }
+  .topbar .brand { letter-spacing: 2px; }
+  .topbar nav { display: flex; gap: 14px; flex-wrap: wrap; }
+  .topbar a { color: var(--phos-dim); text-decoration: none; }
+  .topbar a:hover { color: var(--phos); }
+  .switch {
+    border: 1px solid var(--line); background: transparent; color: var(--phos);
+    font-family: var(--font-term); cursor: pointer; padding: 4px 10px; letter-spacing: 1px;
+    text-shadow: inherit;
+  }
+  .switch:hover { background: rgba(51,255,138,0.08); }
+
+  /* ---- terminal window ---- */
+  .term {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: linear-gradient(180deg, rgba(51,255,138,0.03), rgba(0,0,0,0.25));
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.6), 0 0 40px rgba(51,255,138,0.08) inset, 0 20px 60px rgba(0,0,0,0.6);
+    margin: 22px 0;
+    overflow: hidden;
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-bottom: 1px solid var(--line);
+    background: rgba(0,0,0,0.35); color: var(--phos-dim); letter-spacing: 1px;
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; border: 1px solid var(--line); }
+  .term-title { margin-left: 8px; }
+  .term-body { padding: 18px 18px 22px; }
+
+  /* ---- hero ---- */
+  .ascii {
+    font-family: var(--font-pixel);
+    white-space: pre;
+    line-height: 1;
+    font-size: clamp(10px, 2.6vw, 20px);
+    color: var(--phos);
+    overflow-x: auto;
+    margin: 0 0 6px;
+  }
+  .tagline { font-size: clamp(16px, 3vw, 22px); margin: 10px 0 2px; }
+  .sub { color: var(--phos-dim); max-width: 60ch; }
+  .prompt::before { content: "root@target:~# "; color: var(--phos-dim); }
+  .cursor {
+    display: inline-block; width: 0.6ch; height: 1.1em; background: var(--phos);
+    transform: translateY(0.18em); margin-left: 2px;
+    animation: blink 1.05s steps(1) infinite; box-shadow: 0 0 8px var(--phos-glow);
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .cta { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
+  .btn {
+    display: inline-block; border: 1px solid var(--phos-dim); color: var(--phos);
+    text-decoration: none; padding: 9px 16px; letter-spacing: 1px;
+    background: rgba(51,255,138,0.04); text-shadow: inherit;
+  }
+  .btn:hover { border-color: var(--phos); background: rgba(51,255,138,0.12); }
+  .btn.amber { border-color: var(--amber); color: var(--amber); text-shadow: 0 0 8px rgba(255,176,0,.5); }
+
+  /* ---- sections ---- */
+  section { margin-top: 44px; }
+  h2 {
+    font-family: var(--font-pixel); font-weight: 400; letter-spacing: 2px;
+    font-size: clamp(22px, 4vw, 30px); margin: 0 0 4px;
+  }
+  h2::before { content: "> "; color: var(--phos-dim); }
+  .lead { color: var(--phos-dim); margin: 0 0 18px; }
+
+  pre.block {
+    border: 1px solid var(--line); border-left: 3px solid var(--phos-dim);
+    background: rgba(0,0,0,0.35); padding: 14px 16px; overflow-x: auto;
+    white-space: pre; margin: 14px 0; border-radius: 0 4px 4px 0;
+  }
+  .comment { color: var(--phos-dim); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .card {
+    border: 1px solid var(--line); padding: 16px; border-radius: 4px;
+    background: rgba(0,0,0,0.25);
+  }
+  .card h3 { margin: 0 0 6px; font-family: var(--font-pixel); font-weight: 400; letter-spacing: 1px; font-size: 20px; }
+  .card p { margin: 0; color: var(--phos-dim); }
+  .tag { color: var(--phos); }
+
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { color: var(--phos); letter-spacing: 1px; }
+  td { color: var(--phos-dim); }
+  td .tag { color: var(--phos); }
+
+  ul.rules { list-style: none; padding: 0; margin: 14px 0; }
+  ul.rules li { padding: 4px 0; }
+  ul.rules li::before { content: "[ok] "; color: var(--phos); }
+
+  footer {
+    margin-top: 56px; padding-top: 18px; border-top: 1px solid var(--line);
+    color: var(--phos-dim); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  footer a { color: var(--phos-dim); }
+  footer a:hover { color: var(--phos); }
+
+  .warn {
+    border: 1px solid var(--amber); color: var(--amber);
+    text-shadow: 0 0 8px rgba(255,176,0,.45);
+    padding: 12px 14px; margin: 18px 0; border-radius: 4px; background: rgba(255,176,0,0.05);
+  }
+  a { color: var(--phos); }
+  ::selection { background: var(--phos); color: var(--bg); text-shadow: none; }
+</style>
+</head>
+<body>
+<div class="crt-vignette"></div>
+<div class="crt-scanlines"></div>
+<div class="crt-flicker"></div>
+
+<header class="topbar">
+  <div class="brand">◉ hackbot <span style="color:var(--phos-dim)">v0.1</span></div>
+  <nav>
+    <a href="#what">what</a>
+    <a href="#loop">loop</a>
+    <a href="#safety">safety</a>
+    <a href="#quickstart">quickstart</a>
+    <a href="#tools">tools</a>
+    <a href="https://github.com" target="_blank" rel="noopener">source ↗</a>
+  </nav>
+  <button class="switch" id="phosphor-toggle" title="toggle phosphor color">[P1/P3] phosphor</button>
+</header>
+
+<main class="wrap">
+
+  <!-- HERO -->
+  <div class="term">
+    <div class="term-bar">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="term-title">/dev/ttyS0 — hackbot session</span>
+    </div>
+    <div class="term-body">
+<pre class="ascii">
+ _                _    _           _
+| |__   __ _  ___| | _| |__   ___ | |_
+| '_ \ / _` |/ __| |/ / '_ \ / _ \| __|
+| | | | (_| | (__|   &lt;| |_) | (_) | |_
+|_| |_|\__,_|\___|_|\_\_.__/ \___/ \__|
+</pre>
+      <div class="tagline">An LLM-orchestrated pentest harness.</div>
+      <p class="sub">A ReAct agent (LangGraph) decides which security tools to call against an <b>authorized</b> target — with a hard scope guard, a kill-switch budget, and dry-run by default standing between the model and the network.</p>
+      <div style="margin-top:14px" id="boot"></div>
+      <div class="prompt">hackbot demo --dry-run<span class="cursor"></span></div>
+      <div class="cta">
+        <a class="btn" href="#quickstart">▶ quickstart</a>
+        <a class="btn" href="#safety">⛨ safety model</a>
+        <a class="btn amber" href="https://github.com" target="_blank" rel="noopener">★ view source ↗</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="warn">⚠ AUTHORIZED USE ONLY — point hackbot only at systems you own or have written permission to test. If a target isn't in <span class="tag">scope.json</span>, every network tool hard-fails with a ScopeViolation.</div>
+
+  <!-- WHAT -->
+  <section id="what">
+    <h2>what is this</h2>
+    <p class="lead">A harness, not a weapon. The LLM plans; the guards decide what is allowed to leave the machine.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>agent-driven</h3>
+        <p>The model gets the tool list via <span class="tag">bind_tools</span> and picks what to call at each step — recon, secret scans, findings.</p>
+      </div>
+      <div class="card">
+        <h3>scope-locked</h3>
+        <p>Every network tool calls <span class="tag">check_target</span> first. Host globs + CIDRs + path rules. Out of scope = hard fail.</p>
+      </div>
+      <div class="card">
+        <h3>budgeted</h3>
+        <p>Caps on steps, total requests, and tokens. A kill switch stops the session cold at the request ceiling.</p>
+      </div>
+      <div class="card">
+        <h3>dry-run first</h3>
+        <p>By default, tools return <span class="tag">"would-send"</span> and touch nothing. Going live is an explicit opt-in.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOOP -->
+  <section id="loop">
+    <h2>the react loop</h2>
+    <p class="lead">agent → tools → agent → … → report. It ends on <span class="tag">finish</span>, on an exhausted budget, or when the model has nothing left to call.</p>
+<pre class="block">
+     entry
+       │
+       ▼
+   ┌─────────┐   route    ┌─────────┐
+   │  agent  │──────────▶ │  tools  │─────┐
+   │ (LLM)   │ ◀───────── └─────────┘     │  loop back
+   └────┬────┘                            │
+        │  finish / budget / no-tool-call │
+        ▼                                 │
+   ┌─────────┐        ┌──────────┐        │
+   │ report  │ ◀───── │tools_fin │ ◀──────┘
+   └────┬────┘        └──────────┘
+        ▼
+       END  →  markdown report (findings + actions)
+</pre>
+  </section>
+
+  <!-- SAFETY -->
+  <section id="safety">
+    <h2>safety model</h2>
+    <p class="lead">None of these can be talked around by the model. They live in code, below the agent.</p>
+    <table>
+      <tr><th>guard</th><th>what it does</th></tr>
+      <tr><td class="tag">scope guard</td><td>check_target runs before any I/O: host glob + CIDR, allowed paths, excluded paths. Violation → ScopeViolation.</td></tr>
+      <tr><td class="tag">kill switch</td><td>Hard-fails once request_count ≥ max_total_requests, independent of the soft budget.</td></tr>
+      <tr><td class="tag">dry-run</td><td>Default on. Network tools simulate instead of sending.</td></tr>
+      <tr><td class="tag">authorization</td><td><code>run</code> refuses to start unless scope.authorized_by is set.</td></tr>
+      <tr><td class="tag">budget</td><td>Steps / requests / tokens capped; exhaustion routes straight to the report.</td></tr>
+      <tr><td class="tag">no destructive payloads</td><td>The system prompt forbids DROP, rm -rf, shutdown, fork bombs; prefers reads over writes.</td></tr>
+      <tr><td class="tag">no wildcard host</td><td>allowed_hosts cannot be a bare "*".</td></tr>
+    </table>
+  </section>
+
+  <!-- QUICKSTART -->
+  <section id="quickstart">
+    <h2>quickstart</h2>
+    <p class="lead">Smoke-test with no API key and no network, then verify scope, then go live on an authorized target.</p>
+<pre class="block"><span class="comment"># 1. install (pip or uv)</span>
+pip install -e ".[dev]"
+<span class="comment"># no pip? →</span> uv venv .venv &amp;&amp; source .venv/bin/activate &amp;&amp; uv pip install -e ".[dev]"
+
+<span class="comment"># 2. run the full ReAct loop with a fake LLM — no key, no network</span>
+hackbot demo --dry-run
+
+<span class="comment"># 3. sanity-check your scope (exit 0 = OK, exit 1 = VIOLACAO)</span>
+hackbot check-scope http://localhost:3000 scope.json
+hackbot check-scope http://evil.com       scope.json
+
+<span class="comment"># 4. configure a model</span>
+cp .env.example .env    <span class="comment"># set PH_OPENAI_API_KEY=sk-...</span>
+
+<span class="comment"># 5. dry-run against a real target (still sends nothing)</span>
+hackbot run --target http://localhost:3000 --scope-file scope.json --dry-run
+
+<span class="comment"># 6. go live — only on an authorized target</span>
+hackbot run --target http://juice-shop.lab --scope-file scope.json --no-dry-run --output report.md</pre>
+  </section>
+
+  <!-- TOOLS -->
+  <section id="tools">
+    <h2>tools the agent can call</h2>
+    <p class="lead">Six tools. The network-facing ones are scope-guarded and dry-run aware.</p>
+    <table>
+      <tr><th>tool</th><th>scope?</th><th>purpose</th></tr>
+      <tr><td class="tag">check_scope(url)</td><td>—</td><td>Validate a URL against the scope. Called first.</td></tr>
+      <tr><td class="tag">http_probe(url, method, headers, body)</td><td>✅</td><td>HTTP request. GET/HEAD/OPTIONS/POST/PUT/PATCH. Rate-limited.</td></tr>
+      <tr><td class="tag">scan_js_bundle(url)</td><td>✅</td><td>Download JS and scan for secrets, cards, exfil patterns.</td></tr>
+      <tr><td class="tag">analyze_text_for_secrets(text)</td><td>—</td><td>Local regex: AWS keys, sk- keys, JWTs, cards, private keys.</td></tr>
+      <tr><td class="tag">save_finding(title, severity, evidence, url)</td><td>—</td><td>Record a finding (CRITICAL/HIGH/MEDIUM/LOW/INFO).</td></tr>
+      <tr><td class="tag">finish(reason)</td><td>—</td><td>End the loop and trigger the report.</td></tr>
+    </table>
+  </section>
+
+  <!-- PROVIDERS -->
+  <section id="providers">
+    <h2>any model you like</h2>
+    <p class="lead">OpenAI + Anthropic natively; any OpenAI-compatible endpoint (DeepSeek, GLM/Zhipu, local) via PH_LLM_BASE_URL.</p>
+<pre class="block"><span class="comment"># DeepSeek (OpenAI-compatible)</span>
+export PH_LLM_PROVIDER=openai
+export PH_LLM_MODEL=deepseek-chat
+export PH_LLM_BASE_URL=https://api.deepseek.com/v1
+export PH_OPENAI_API_KEY=sk-...
+
+<span class="comment"># Anthropic</span>
+export PH_LLM_PROVIDER=anthropic
+export PH_LLM_MODEL=claude-3-5-sonnet-latest
+export PH_ANTHROPIC_API_KEY=sk-ant-...</pre>
+  </section>
+
+  <footer>
+    <span>hackbot // phosphor terminal — authorized pentest harness</span>
+    <span><a href="#top">▲ top</a> · <a href="https://github.com" target="_blank" rel="noopener">github ↗</a></span>
+  </footer>
+</main>
+
+<script>
+  // phosphor P1 (green) / P3 (amber) toggle, persisted
+  (function () {
+    var root = document.documentElement;
+    var btn = document.getElementById("phosphor-toggle");
+    try {
+      var saved = localStorage.getItem("hackbot-phosphor");
+      if (saved) root.setAttribute("data-phosphor", saved);
+    } catch (e) {}
+    btn.addEventListener("click", function () {
+      var next = root.getAttribute("data-phosphor") === "green" ? "amber" : "green";
+      root.setAttribute("data-phosphor", next);
+      try { localStorage.setItem("hackbot-phosphor", next); } catch (e) {}
+    });
+  })();
+
+  // boot sequence typing effect
+  (function () {
+    var host = document.getElementById("boot");
+    if (!host) return;
+    var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var lines = [
+      "[boot] loading scope_guard ................ ok",
+      "[boot] loading budget (steps/requests/tokens) ok",
+      "[boot] dry_run=true  require_authorization=true",
+      "[boot] binding 6 tools to agent ........... ok",
+      "[boot] ReAct graph compiled ............... ok",
+    ];
+    if (reduce) {
+      host.innerHTML = lines.map(function (l) {
+        return '<div class="comment">' + l + "</div>";
+      }).join("");
+      return;
+    }
+    var li = 0, ci = 0, cur = null;
+    function tick() {
+      if (li >= lines.length) return;
+      if (ci === 0) {
+        cur = document.createElement("div");
+        cur.className = "comment";
+        host.appendChild(cur);
+      }
+      cur.textContent = lines[li].slice(0, ci++);
+      if (ci > lines[li].length) { li++; ci = 0; setTimeout(tick, 180); }
+      else setTimeout(tick, 11);
+    }
+    tick();
+  })();
+</script>
+</body>
+</html>
