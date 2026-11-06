@@ -88,6 +88,9 @@ These are the guardrails, and none of them can be bypassed by the LLM:
 | **Budget** | `budget.Budget` | Caps steps, total requests, and tokens. Raises `BudgetExhausted`, which routes the graph straight to the report. |
 | **No destructive payloads** | `prompts.SYSTEM_PROMPT` | The agent is instructed never to send `DROP`, `rm -rf`, shutdown, fork bombs, etc., and to prefer reads over writes. |
 | **No wildcard host** | `TargetScope` validator | `allowed_hosts` cannot contain a bare `"*"`. |
+| **External tools gate** | `Settings.enable_external_tools` (default `False`) | `nuclei_scan`/`ffuf_scan`/`sqlmap_scan` refuse to run at all — even in dry-run — until explicitly enabled. A second, independent gate on top of scope/dry-run. |
+| **sqlmap denylist** | `tools.SQLMAP_DENYLIST` | `--os-shell`, `--file-write/read`, `--dump-all`, registry flags, etc. are always rejected regardless of what `extra_args` the agent requests; `--risk`/`--level` are always forced to `1`. |
+| **Verified findings** | `verify_finding` tool | Re-executes the HTTP PoC and checks it against an expected status/substring **before** registering anything. A scope violation, dry-run, or mismatch means nothing is saved. |
 
 ---
 
@@ -164,6 +167,9 @@ All settings use the `PH_` prefix and can live in `.env`. Defaults shown:
 | `PH_MAX_STEPS` | `20` | Max agent iterations. |
 | `PH_MAX_TOKENS_BUDGET` | `200000` | Token budget across the session. |
 | `PH_USER_AGENT` | `hackbot/0.1 (+authorized-pentest)` | Sent on every live request. |
+| `PH_ENABLE_EXTERNAL_TOOLS` | `false` | Second gate, independent of `dry_run`, required before `nuclei_scan`/`ffuf_scan`/`sqlmap_scan` will run at all. |
+| `PH_EXTERNAL_TOOL_TIMEOUT` | `60` | Seconds before an external scanner subprocess is killed. |
+| `PH_NUCLEI_BIN` / `PH_FFUF_BIN` / `PH_SQLMAP_BIN` | `nuclei` / `ffuf` / `sqlmap` | Binary name or path looked up on `PATH`. |
 
 > The `demo` and `--dry-run` paths **do not need an API key** — `demo` uses a fake
 > scripted LLM and dry-run never hits the network.
@@ -282,18 +288,76 @@ is empty.
 
 ## Tools exposed to the agent
 
-| Tool | Scope-guarded | Respects dry-run | Purpose |
-|------|:---:|:---:|---------|
-| `check_scope(url)` | — | — | Validate a URL against the scope. The agent is told to call this first. |
-| `http_probe(url, method, headers, body)` | ✅ | ✅ | HTTP request. Methods limited to `GET/HEAD/OPTIONS/POST/PUT/PATCH`. Rate-limited. |
-| `scan_js_bundle(url)` | ✅ | ✅ | Download a JS file and scan for secrets, cards, and exfil patterns (`eval(`, `atob(`, `document.cookie`, …). |
-| `analyze_text_for_secrets(text)` | — | — | Regex scan of pasted text (AWS keys, `sk-` keys, JWTs, card numbers, private keys). Local only, no I/O. |
-| `save_finding(title, severity, evidence, url)` | — | — | Record a finding. Severity ∈ `CRITICAL/HIGH/MEDIUM/LOW/INFO`. |
-| `finish(reason)` | — | — | End the loop and trigger the report. |
+| Tool | Scope-guarded | Dry-run | External gate | Purpose |
+|------|:---:|:---:|:---:|---------|
+| `check_scope(url)` | — | — | — | Validate a URL against the scope. The agent is told to call this first. |
+| `http_probe(url, method, headers, body)` | ✅ | ✅ | — | HTTP request. Methods limited to `GET/HEAD/OPTIONS/POST/PUT/PATCH`. Rate-limited. |
+| `scan_js_bundle(url)` | ✅ | ✅ | — | Download a JS file and scan it: regex secret patterns **and** a real AST walk (see below) — not just substring grepping. |
+| `analyze_text_for_secrets(text)` | — | — | — | Regex + AST scan of pasted text. Local only, no I/O. |
+| `save_finding(title, severity, evidence, url)` | — | — | — | Record an observational finding (no PoC re-check). Severity ∈ `CRITICAL/HIGH/MEDIUM/LOW/INFO`. Stored with `verified: false`. |
+| `verify_finding(title, severity, url, method, expected_status, expected_substring, ...)` | ✅ | ✅ | — | **Re-executes** the HTTP PoC and only registers the finding (`verified: true`) if the response actually matches. Nothing is saved on a scope violation, dry-run, budget cap, or mismatch. |
+| `nuclei_scan(url, templates)` | ✅ | ✅ | ✅ | Run `nuclei` against the target. Requires the binary on `PATH` and `PH_ENABLE_EXTERNAL_TOOLS=true`. |
+| `ffuf_scan(url, wordlist, extra_args)` | ✅ | ✅ | ✅ | Run `ffuf` for path/param fuzzing. Auto-appends the `FUZZ` marker if the URL doesn't already have one. |
+| `sqlmap_scan(url, data, extra_args)` | ✅ | ✅ | ✅ | Run `sqlmap` in non-interactive, low-risk mode. `--batch --risk=1 --level=1` are always forced; destructive flags (`--os-shell`, `--file-write`, `--dump-all`, …) are always rejected, even if requested in `extra_args`. |
+| `finish(reason)` | — | — | — | End the loop and trigger the report. |
 
 The secret detectors (`SECRET_PATTERNS` in `tools.py`) cover: AWS access key ids
 (`AKIA…`), OpenAI-style keys (`sk-…`), JWTs, 13–19 digit card numbers, and PEM
-private key headers.
+private key headers — checked both by regex and against string literals found
+in the AST.
+
+### AST-based JS analysis
+
+`scan_js_bundle` and `analyze_text_for_secrets` parse the JS with
+[`esprima`](https://pypi.org/project/esprima/) and walk the real syntax tree
+instead of grepping for substrings like `"eval("`. It flags:
+
+- **Dangerous execution** — `eval(...)`, `new Function(...)`.
+- **Obfuscation/decoding** — `atob`, `btoa`, `escape`, `unescape`.
+- **Exfiltration sinks** — `document.cookie`, `window.localStorage`,
+  `window.sessionStorage`, `navigator.sendBeacon`.
+- **Outbound network calls** — `fetch(...)`, `new XMLHttpRequest(...)`.
+- **Secrets embedded as string literals** — any literal ≥16 chars matched
+  against `SECRET_PATTERNS`.
+
+If `esprima` can't parse the file (not valid JS, or it fails to import), the
+tool degrades gracefully: it says so and the regex pass still runs — it never
+raises or blocks the loop.
+
+### External tools: nuclei / ffuf / sqlmap
+
+These wrap real, well-known scanners and are **off by default**, behind
+`PH_ENABLE_EXTERNAL_TOOLS` — a second gate on top of scope and dry-run, so the
+agent can never reach for them unless the operator explicitly opted in and
+installed the binaries. All three:
+
+- call `check_target` before building a command,
+- run via `asyncio.create_subprocess_exec` with a **list** argv — never
+  `shell=True` — so nothing an argument contains can break out into a shell,
+- respect `dry_run` (return the exact command that *would* run, nothing is
+  executed), the budget, and `PH_EXTERNAL_TOOL_TIMEOUT`,
+- fail with a clear message (not a crash) if the binary isn't on `PATH`.
+
+`sqlmap_scan` adds a hard denylist (`tools.SQLMAP_DENYLIST`) rejecting flags
+like `--os-shell`, `--os-pwn`, `--file-write`/`--file-read`, `--dump-all`,
+and registry flags — regardless of what's passed in `extra_args` — and always
+forces `--batch --risk=1 --level=1`, stripping any attempt to override the
+risk/level from `extra_args`.
+
+### `verify_finding` vs `save_finding`
+
+`save_finding` trusts the agent's narrative — useful for purely observational
+notes. `verify_finding` is the stricter, PoC-backed path: it replays the HTTP
+request through the exact same guarded/budgeted code path as `http_probe`,
+and only appends to the findings list (with `verified: true`) if the response
+actually matches an `expected_status` and/or `expected_substring` you give
+it. A scope violation, dry-run, exhausted budget, or a response that doesn't
+match means **nothing is recorded** — the agent gets a `NAO_VERIFICADO` /
+`NAO_REPRODUZIDO` message back instead, so it can't silently report something
+it never actually reproduced. The system prompt tells the agent to prefer
+`verify_finding` for anything with a reproducible PoC (IDOR, auth bypass,
+missing headers, exposed secrets) and reserve `save_finding` for notes that
+have no direct HTTP check.
 
 ---
 
@@ -450,13 +514,20 @@ hackbot/
 │   ├── llm.py           # build_llm (openai/anthropic/base_url)
 │   ├── prompts.py       # SYSTEM_PROMPT (rules of engagement)
 │   ├── state.py         # AttackState (LangGraph TypedDict)
-│   ├── tools.py         # the tools the agent can call
+│   ├── tools.py         # agent tools: http/JS-AST/verify_finding/nuclei/ffuf/sqlmap
 │   ├── graph.py         # the ReAct graph: agent → tools → report
 │   └── cli.py           # typer CLI: run / demo / check-scope
+├── scripts/
+│   └── make_og.py       # regenerates docs/og.png (social share thumbnail)
+├── docs/                # GitHub Pages site (phosphor-CRT theme)
+│   ├── index.html
+│   ├── favicon.svg
+│   └── og.png
 └── tests/
     ├── test_scope_guard.py
     ├── test_budget.py
-    └── test_agent_loop.py
+    ├── test_agent_loop.py
+    └── test_tools.py    # AST scan, nuclei/ffuf/sqlmap gating, verify_finding
 ```
 
 ---
@@ -464,13 +535,15 @@ hackbot/
 ## Development & testing
 
 ```bash
-pytest -q            # run the suite (10 tests)
+pytest -q            # run the suite (28 tests)
 ruff check .         # lint
 ```
 
 The test suite validates the scope guard (out-of-scope host, wildcard subdomain,
-excluded path, kill switch, wildcard-host rejection), the budget caps, and the
-full ReAct loop end-to-end with a fake LLM — no network and no API key required.
+excluded path, kill switch, wildcard-host rejection), the budget caps, the full
+ReAct loop end-to-end with a fake LLM, the AST/regex JS analysis, and that the
+external-tool wrappers and `verify_finding` never run or save anything outside
+their guardrails — no network, no subprocess, and no API key required.
 
 ---
 
@@ -483,3 +556,6 @@ full ReAct loop end-to-end with a fake LLM — no network and no API key require
 | `scope.authorized_by e obrigatorio` | Set `authorized_by` in `scope.json`, or set `PH_REQUIRE_AUTHORIZATION=false` (not recommended). |
 | Every tool returns `VIOLACAO` | The target isn't in `allowed_hosts`/`allowed_cidrs`, its path isn't in `allowed_paths`, or it matches an `exclude_paths` entry. Check with `check-scope`. |
 | Loop ends immediately with an empty report | The LLM returned no tool calls on the first step. Check your model/key and the system prompt. |
+| `nuclei_scan`/`ffuf_scan`/`sqlmap_scan` return `DESABILITADO` | Set `PH_ENABLE_EXTERNAL_TOOLS=true` **and** make sure the corresponding binary is installed and on `PATH`. |
+| `sqlmap_scan` returns `BLOQUEADO: flag perigosa ...` | That flag is on the hard denylist (`tools.SQLMAP_DENYLIST`) and cannot be passed via `extra_args`, by design. |
+| `verify_finding` keeps returning `NAO_VERIFICADO`/`NAO_REPRODUZIDO` | Either it's running in dry-run (nothing is sent), the URL is out of scope, or the live response genuinely doesn't match `expected_status`/`expected_substring`. Check with `http_probe` first. |

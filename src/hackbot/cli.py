@@ -82,19 +82,25 @@ def check_scope(target: str, scope_file: Path) -> None:
     scope = load_scope(scope_file)
     try:
         check_target(Target(target), scope, 0, 500)
-        console.print(f"[green]OK[/green] {target} dentro do escopo")
+        # style= colors the whole line without parsing the interpolated text
+        # as markup — a target/path containing "[" or "]" must never be
+        # misread as a style tag (and must never silently vanish from output).
+        console.print(f"OK {target} dentro do escopo", style="green")
     except ScopeViolation as exc:
-        console.print(f"[red]VIOLACAO[/red] {exc}")
+        console.print(f"VIOLACAO {exc}", style="red")
         raise typer.Exit(1)
 
 
 def _emit(final: dict, output: Path | None) -> None:
     report = final.get("final_report", "")
-    console.print(report)
+    # markup=False: the report embeds LLM-authored finding titles/evidence
+    # and tags like "[VERIFIED]"/"[unverified]" — rich would otherwise parse
+    # those brackets as style markup and silently drop or corrupt them.
+    console.print(report, markup=False)
     console.print_json(json.dumps(final.get("budget_snapshot", {})))
     if output:
         output.write_text(report, encoding="utf-8")
-        console.print(f"[green]relatorio salvo em {output}[/green]")
+        console.print(f"relatorio salvo em {output}", style="green")
 
 
 class FakeToolCallingLLM(FakeListChatModel):

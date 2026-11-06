@@ -45,6 +45,15 @@ class Settings(BaseSettings):
     workspace_dir: Path = Path("./.hackbot")
     user_agent: str = "hackbot/0.1 (+authorized-pentest)"
 
+    # External scanner tools (nuclei/ffuf/sqlmap). Off by default: a second,
+    # independent gate on top of dry_run/scope_guard — these shell out to real
+    # binaries and must be explicitly opted into, never inferred by the agent.
+    enable_external_tools: bool = False
+    external_tool_timeout: float = 60.0
+    nuclei_bin: str = "nuclei"
+    ffuf_bin: str = "ffuf"
+    sqlmap_bin: str = "sqlmap"
+
 
 def load_scope(path: Path) -> TargetScope:
     return TargetScope.model_validate_json(path.read_text())

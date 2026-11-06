@@ -60,13 +60,15 @@ def build_graph(
         lines = ["# Relatorio de Pentest (hackbot)", ""]
         lines.append(f"**Alvo:** {state.get('target_url', '?')}")
         lines.append(f"**Budget:** {budget.snapshot()}")
-        lines.append(f"**Achados:** {len(findings)}")
+        verified_count = sum(1 for f in findings if f.get("verified"))
+        lines.append(f"**Achados:** {len(findings)} ({verified_count} verificados via PoC)")
         lines.append("")
         lines.append("## Achados")
         if not findings:
             lines.append("_Nenhum achado registrado._")
         for f in findings:
-            lines.append(f"- **[{f['severity']}]** {f['title']} — {f['url']}")
+            tag = "[VERIFIED]" if f.get("verified") else "[unverified]"
+            lines.append(f"- **[{f['severity']}]** {tag} {f['title']} — {f['url']}")
             lines.append(f"  - evidencia: `{f['evidence'][:300]}`")
         lines.append("")
         lines.append("## Acoes executadas")
