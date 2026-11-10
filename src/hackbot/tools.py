@@ -10,7 +10,16 @@ from langchain_core.tools import tool
 
 from .budget import Budget, BudgetExhausted
 from .config import Settings, TargetScope
-from .scope_guard import ScopeViolation, Target, check_target
+from .scope_guard import (
+    CheckedTarget,
+    IPAddress,
+    Resolver,
+    ScopeViolation,
+    Target,
+    check_target,
+    resolve_target,
+    system_resolver,
+)
 
 SECRET_PATTERNS = {
     "aws_akid": re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -20,16 +29,133 @@ SECRET_PATTERNS = {
     "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
 
-# sqlmap flags that can turn a scan into code execution, file access, or data
-# exfiltration beyond the query itself. Always rejected, regardless of
-# enable_external_tools — this is a hard denylist, not a default.
-SQLMAP_DENYLIST = (
-    "--os-shell", "--os-pwn", "--os-cmd", "--os-smbrelay", "--os-bof",
-    "--priv-esc", "--file-write", "--file-dest", "--file-read",
-    "--dump-all", "--passwords", "--privileges", "--all",
-    "--reg-add", "--reg-del", "--reg-read", "--registry-read",
-    "--registry-write", "--registry-process", "--sql-shell", "--eval",
-)
+# sqlmap: allowlist, not a denylist. Any flag not listed here is rejected.
+# A denylist let through `-u` (swaps the target, escaping scope), `-m`/`-l`/`-g`
+# (targets from a file/log/Google), `--alert` (runs a command on this host),
+# `--proxy`, `--tamper` (loads arbitrary Python) and abbreviations of denied
+# flags (optparse accepts unique prefixes like `--os-sh`).
+SQLMAP_FORCED = ("--batch", "--risk=1", "--level=1")
+_SQLMAP_SWITCHES = frozenset({
+    "--batch", "--random-agent", "--banner", "--current-user", "--current-db",
+    "--is-dba", "--dbs", "--tables", "--columns", "--count", "--skip-static",
+    "--flush-session", "--fresh-queries", "--text-only", "--titles", "--smart",
+    "--keep-alive", "--null-connection", "--hex", "--no-cast", "--parse-errors",
+})
+_SQLMAP_OPTIONS = frozenset({
+    "-p", "--technique", "--dbms", "--string", "--not-string", "--regexp", "--code",
+    "--prefix", "--suffix", "--timeout", "--retries", "--delay", "--cookie",
+    "--cookie-del", "--headers", "-H", "--method", "--param-del", "-D", "-T", "-C",
+    "--skip", "--time-sec", "--union-cols", "--union-char", "--threads", "-v",
+})
+_SQLMAP_DROPPED = frozenset({"--risk", "--level"})  # silently replaced by SQLMAP_FORCED
+_SQLMAP_MAX_THREADS = 4
+MAX_JS_REDIRECTS = 5
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+
+class ToolArgsDenied(ValueError):
+    """Argumento de ferramenta externa fora da allowlist."""
+
+
+def sanitize_sqlmap_args(tokens: list[str]) -> list[str]:
+    """Valida extra_args do sqlmap contra a allowlist e devolve a lista final
+    com os parametros obrigatorios (`--batch --risk=1 --level=1`) na frente."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if not token.startswith("-"):
+            raise ToolArgsDenied(f"argumento posicional nao permitido: {token!r}")
+        name, has_value, value = token.partition("=")
+        if name in _SQLMAP_DROPPED:
+            i += 1 if has_value else 2
+            continue
+        if name in _SQLMAP_SWITCHES:
+            if has_value:
+                raise ToolArgsDenied(f"{name} nao aceita valor")
+            out.append(name)
+            i += 1
+            continue
+        if name not in _SQLMAP_OPTIONS:
+            raise ToolArgsDenied(f"flag nao permitida no sqlmap: {name}")
+        if not has_value:
+            if i + 1 >= len(tokens):
+                raise ToolArgsDenied(f"{name} precisa de um valor")
+            value = tokens[i + 1]
+            i += 2
+        else:
+            i += 1
+        if not value or value.startswith("-"):
+            raise ToolArgsDenied(f"valor invalido para {name}: {value!r}")
+        if name in ("--headers", "-H") and any(
+            line.strip().lower().startswith("host:") for line in re.split(r"\\n|\n", value)
+        ):
+            raise ToolArgsDenied("cabecalho Host nao pode ser alterado")
+        if name == "--threads":
+            try:
+                threads = int(value)
+            except ValueError as exc:
+                raise ToolArgsDenied(f"--threads invalido: {value!r}") from exc
+            value = str(max(1, min(threads, _SQLMAP_MAX_THREADS)))
+        out += [name, value]
+    return [*SQLMAP_FORCED, *out]
+
+
+# --------------------------------------------------------------------------
+# HTTP egress: every request connects to an already-validated IP (DNS
+# pinning) with the original Host header and TLS SNI, so a second DNS
+# resolution cannot redirect it (rebinding). trust_env=False so HTTP_PROXY /
+# HTTPS_PROXY / ALL_PROXY in the environment cannot reroute traffic.
+# --------------------------------------------------------------------------
+
+def _new_client(
+    timeout: float, transport: httpx.AsyncBaseTransport | None = None
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=timeout, follow_redirects=False, trust_env=False, transport=transport
+    )
+
+
+def _prepare_headers(
+    checked: CheckedTarget, user_agent: str, headers: dict[str, str] | None
+) -> dict[str, str]:
+    """Monta os headers. Um Host diferente do alvo e recusado: num IP
+    permitido, um proxy reverso poderia encaminhar para fora do escopo."""
+    prepared = {"User-Agent": user_agent}
+    for name, value in (headers or {}).items():
+        if name.strip().lower() == "host":
+            if value.strip().lower() != checked.host_header.lower():
+                raise ScopeViolation(f"cabecalho Host '{value}' difere do alvo '{checked.host_header}'")
+            continue
+        prepared[name] = value
+    prepared["Host"] = checked.host_header
+    return prepared
+
+
+async def _pinned_send(
+    client: httpx.AsyncClient,
+    method: str,
+    checked: CheckedTarget,
+    ips: list[IPAddress],
+    headers: dict[str, str],
+    content: str | None,
+) -> httpx.Response:
+    extensions = {"sni_hostname": checked.host} if checked.scheme == "https" else {}
+    last_error: httpx.HTTPError | None = None
+    for ip in ips:
+        request = client.build_request(
+            method,
+            checked.url.copy_with(host=str(ip)),
+            headers=headers,
+            content=content,
+            extensions=extensions,
+        )
+        try:
+            return await client.send(request)
+        except httpx.ConnectError as exc:
+            last_error = exc  # try the next IP (all of them already validated)
+    assert last_error is not None
+    raise last_error
 
 
 # --------------------------------------------------------------------------
@@ -168,18 +294,28 @@ def make_tools(
     budget: Budget,
     findings: list[dict[str, Any]],
     actions: list[str],
+    *,
+    resolver: Resolver = system_resolver,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> list:
-    """Factory: cria tools com closures sobre settings/scope/budget/coletores."""
+    """Factory: cria tools com closures sobre settings/scope/budget/coletores.
+    `resolver` e `transport` existem para testes (DNS e rede falsos)."""
 
-    async def _guard_or_none(url: str) -> str | None:
-        """Shared scope check used by every network-facing tool. Returns an
-        error string on violation, or None when the URL is clear to proceed.
+    async def _guard(url: str) -> tuple[CheckedTarget, list[IPAddress]] | str:
+        """Shared scope check used by every network-facing tool: URL/host/path
+        rules plus DNS resolution with every resolved IP validated. Returns
+        (checked_target, validated_ips), or an error string on violation.
         """
         try:
-            check_target(Target(url), scope, budget.requests, settings.max_total_requests)
-            return None
+            checked = check_target(Target(url), scope, budget.requests, settings.max_total_requests)
+            ips = await resolve_target(checked, scope, resolver)
         except ScopeViolation as exc:
             return f"VIOLACAO: {exc}"
+        return checked, ips
+
+    async def _guard_or_none(url: str) -> str | None:
+        result = await _guard(url)
+        return result if isinstance(result, str) else None
 
     async def _do_http_request(
         url: str, method: str, headers: dict[str, str] | None, body: str
@@ -188,12 +324,17 @@ def make_tools(
         exact same guarded/budgeted/rate-limited request path.
         Returns (ok, message_or_dry_run_text, response_or_None).
         """
-        violation = await _guard_or_none(url)
-        if violation:
-            return False, violation, None
+        guarded = await _guard(url)
+        if isinstance(guarded, str):
+            return False, guarded, None
+        checked, ips = guarded
         method = method.upper()
         if method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"}:
             return False, f"metodo nao permitido: {method}", None
+        try:
+            h = _prepare_headers(checked, settings.user_agent, headers)
+        except ScopeViolation as exc:
+            return False, f"VIOLACAO: {exc}", None
         if settings.dry_run:
             actions.append(f"DRY http_probe {method} {url}")
             return False, f"DRY_RUN: would {method} {url} (body={len(body)}B)", None
@@ -202,12 +343,9 @@ def make_tools(
         except BudgetExhausted as exc:
             return False, f"BUDGET: {exc}", None
         delay = 1.0 / max(scope.max_requests_per_second, 0.1)
-        h = {"User-Agent": settings.user_agent}
-        if headers:
-            h.update(headers)
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+        async with _new_client(15.0, transport) as client:
             try:
-                resp = await client.request(method, url, headers=h, content=body or None)
+                resp = await _pinned_send(client, method, checked, ips, h, body or None)
             except httpx.HTTPError as exc:
                 actions.append(f"ERR http_probe {method} {url}: {exc}")
                 return False, f"ERRO: {exc}", None
@@ -247,15 +385,30 @@ def make_tools(
         if settings.dry_run:
             actions.append(f"DRY scan_js_bundle {url}")
             return f"DRY_RUN: would download, AST-parse and regex-scan {url}"
-        try:
-            budget.request(1)
-        except BudgetExhausted as exc:
-            return f"BUDGET: {exc}"
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url, headers={"User-Agent": settings.user_agent})
-            except httpx.HTTPError as exc:
-                return f"ERRO: {exc}"
+        # Redirects are followed by hand so every hop goes back through the
+        # full scope + IP guard (httpx's follow_redirects would skip it).
+        current = url
+        async with _new_client(30.0, transport) as client:
+            for _ in range(MAX_JS_REDIRECTS + 1):
+                guarded = await _guard(current)
+                if isinstance(guarded, str):
+                    return f"{guarded} (redirect a partir de {url})"
+                checked, ips = guarded
+                try:
+                    budget.request(1)
+                except BudgetExhausted as exc:
+                    return f"BUDGET: {exc}"
+                headers = _prepare_headers(checked, settings.user_agent, None)
+                try:
+                    resp = await _pinned_send(client, "GET", checked, ips, headers, None)
+                except httpx.HTTPError as exc:
+                    return f"ERRO: {exc}"
+                location = resp.headers.get("location")
+                if resp.status_code not in _REDIRECT_CODES or not location:
+                    break
+                current = str(httpx.URL(current).join(location))
+            else:
+                return f"ERRO: mais de {MAX_JS_REDIRECTS} redirects a partir de {url}"
         text = resp.text
         regex_hits = _regex_secret_hits(text)
         ast_hits = _ast_scan(text)
@@ -404,28 +557,22 @@ def make_tools(
     async def sqlmap_scan(url: str, data: str = "", extra_args: str = "") -> str:
         """Roda sqlmap em modo nao-interativo e de baixo risco contra o alvo
         (requer PH_ENABLE_EXTERNAL_TOOLS=true e o binario 'sqlmap' no PATH).
-        --batch, --risk=1 e --level=1 sao sempre forcados; flags perigosas
-        (os-shell, file-write/read, dump-all, etc.) sao sempre bloqueadas,
-        mesmo se pedidas em extra_args. Scope-guarded, respeita dry_run."""
+        --batch, --risk=1 e --level=1 sao sempre forcados; extra_args passa por
+        uma allowlist (ex: -p, --technique, --dbms, --cookie, --threads<=4) e
+        qualquer outra flag e recusada. Scope-guarded, respeita dry_run."""
         if not settings.enable_external_tools:
             return "DESABILITADO: defina PH_ENABLE_EXTERNAL_TOOLS=true para habilitar nuclei/ffuf/sqlmap"
         violation = await _guard_or_none(url)
         if violation:
             return violation
-        extra_tokens = shlex.split(extra_args) if extra_args else []
-        for tok in extra_tokens:
-            low = tok.lower().split("=")[0]
-            if low in SQLMAP_DENYLIST:
-                return f"BLOQUEADO: flag perigosa '{tok}' nao permitida em sqlmap_scan"
-        # strip any attempt to override risk/level; we fix them ourselves
-        extra_tokens = [
-            t for t in extra_tokens
-            if not t.lower().startswith(("--risk", "--level"))
-        ]
-        cmd = [settings.sqlmap_bin, "-u", url, "--batch", "--risk=1", "--level=1"]
+        try:
+            safe_args = sanitize_sqlmap_args(shlex.split(extra_args) if extra_args else [])
+        except (ToolArgsDenied, ValueError) as exc:
+            return f"BLOQUEADO: {exc}"
+        cmd = [settings.sqlmap_bin, "-u", url, *safe_args[: len(SQLMAP_FORCED)]]
         if data:
             cmd += ["--data", data]
-        cmd += extra_tokens
+        cmd += safe_args[len(SQLMAP_FORCED):]
         if settings.dry_run:
             actions.append(f"DRY sqlmap_scan {url}")
             return f"DRY_RUN: would run `{shlex.join(cmd)}`"

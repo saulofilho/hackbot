@@ -81,7 +81,9 @@ These are the guardrails, and none of them can be bypassed by the LLM:
 
 | Guard | Where | What it does |
 |-------|-------|--------------|
-| **Scope guard** | `scope_guard.check_target` | Every network tool calls it **before** any I/O. Validates host (glob + CIDR), allowed paths, and excluded paths. A violation raises `ScopeViolation`. |
+| **Scope guard** | `scope_guard.check_target` | Every network tool calls it **before** any I/O. Parses the URL with the same parser that sends it, rejects userinfo (`user@host`), backslashes, whitespace/control chars and non-HTTP schemes, validates host (glob + CIDR), then **normalizes the path** (percent-decoding, `;params`, `.`/`..`, repeated slashes; double encoding is rejected) before matching allowed/excluded paths. Exclusions are case-insensitive and cover sub-paths. A violation raises `ScopeViolation`. |
+| **IP policy / DNS pinning** | `scope_guard.resolve_target` | Resolves the host and validates **every** resolved IP. Cloud metadata (`169.254.169.254`, `fd00:ec2::254`, ...) is always denied; internal ranges (loopback, RFC 1918, link-local...) only pass if listed in `allowed_cidrs`, given as a literal IP in `allowed_hosts`, or reached via `localhost`. Requests then connect to the validated IP with the original `Host` header and TLS SNI, so DNS rebinding cannot change the destination. |
+| **Egress hygiene** | `tools._prepare_headers`, `tools._new_client` | A `Host` header that differs from the target is rejected. HTTP clients use `trust_env=False` (env proxies ignored). `scan_js_bundle` follows redirects manually, re-checking every hop. |
 | **Kill switch** | `scope_guard.check_target` | Hard-fails once `request_count >= max_total_requests`, independent of the soft budget counter. |
 | **Dry-run** | `Settings.dry_run` (default `True`) | Network tools return a `DRY_RUN: would ...` string instead of sending anything. You must explicitly opt in with `--no-dry-run`. |
 | **Authorization** | `Settings.require_authorization` (default `True`) | `run` refuses to start unless `scope.authorized_by` is set. |
@@ -89,7 +91,7 @@ These are the guardrails, and none of them can be bypassed by the LLM:
 | **No destructive payloads** | `prompts.SYSTEM_PROMPT` | The agent is instructed never to send `DROP`, `rm -rf`, shutdown, fork bombs, etc., and to prefer reads over writes. |
 | **No wildcard host** | `TargetScope` validator | `allowed_hosts` cannot contain a bare `"*"`. |
 | **External tools gate** | `Settings.enable_external_tools` (default `False`) | `nuclei_scan`/`ffuf_scan`/`sqlmap_scan` refuse to run at all — even in dry-run — until explicitly enabled. A second, independent gate on top of scope/dry-run. |
-| **sqlmap denylist** | `tools.SQLMAP_DENYLIST` | `--os-shell`, `--file-write/read`, `--dump-all`, registry flags, etc. are always rejected regardless of what `extra_args` the agent requests; `--risk`/`--level` are always forced to `1`. |
+| **sqlmap allowlist** | `tools.sanitize_sqlmap_args` | `extra_args` must only use allowlisted flags (`-p`, `--technique`, `--dbms`, `--cookie`, `--threads` (max 4), ...). Anything else, including `-u`, `-m`, `-g`, `-l`, `--alert`, `--proxy`, `--tamper`, abbreviated flags or a `Host` header, is rejected. `--batch --risk=1 --level=1` are always forced. |
 | **Verified findings** | `verify_finding` tool | Re-executes the HTTP PoC and checks it against an expected status/substring **before** registering anything. A scope violation, dry-run, or mismatch means nothing is saved. |
 
 ---
@@ -140,7 +142,7 @@ $EDITOR scope.json       # define the authorized target
 | Field | Meaning |
 |-------|---------|
 | `allowed_hosts` | Glob patterns (`fnmatch`). `*.lab` matches `juice-shop.lab`. A bare `"*"` is rejected. |
-| `allowed_cidrs` | IP ranges. A target whose host is an IP inside one of these is allowed. |
+| `allowed_cidrs` | IP ranges. A target whose host is an IP inside one of these is allowed. Also required when an allowed **hostname** resolves to an internal IP (e.g. `juice-shop.lab` -> `10.10.10.5`). Cloud metadata addresses are denied even if listed. |
 | `allowed_paths` | Glob patterns a request path must match (e.g. `"/*"`, `"/api/*"`). |
 | `exclude_paths` | Glob patterns that are **always** blocked, even if `allowed_paths` would allow them. |
 | `max_requests_per_second` | Client-side rate limit applied between live requests. |
@@ -338,11 +340,11 @@ installed the binaries. All three:
   executed), the budget, and `PH_EXTERNAL_TOOL_TIMEOUT`,
 - fail with a clear message (not a crash) if the binary isn't on `PATH`.
 
-`sqlmap_scan` adds a hard denylist (`tools.SQLMAP_DENYLIST`) rejecting flags
-like `--os-shell`, `--os-pwn`, `--file-write`/`--file-read`, `--dump-all`,
-and registry flags — regardless of what's passed in `extra_args` — and always
-forces `--batch --risk=1 --level=1`, stripping any attempt to override the
-risk/level from `extra_args`.
+`sqlmap_scan` checks `extra_args` against an allowlist
+(`tools.sanitize_sqlmap_args`): any flag not listed, such as `-u` (target swap),
+`-m`/`-l`/`-g`, `--alert`, `--proxy`, `--tamper`, `--os-shell` or an
+abbreviation like `--os-sh`, is rejected. It always forces
+`--batch --risk=1 --level=1`, dropping any `--risk`/`--level` from `extra_args`.
 
 ### `verify_finding` vs `save_finding`
 
@@ -557,5 +559,5 @@ their guardrails — no network, no subprocess, and no API key required.
 | Every tool returns `VIOLACAO` | The target isn't in `allowed_hosts`/`allowed_cidrs`, its path isn't in `allowed_paths`, or it matches an `exclude_paths` entry. Check with `check-scope`. |
 | Loop ends immediately with an empty report | The LLM returned no tool calls on the first step. Check your model/key and the system prompt. |
 | `nuclei_scan`/`ffuf_scan`/`sqlmap_scan` return `DESABILITADO` | Set `PH_ENABLE_EXTERNAL_TOOLS=true` **and** make sure the corresponding binary is installed and on `PATH`. |
-| `sqlmap_scan` returns `BLOQUEADO: flag perigosa ...` | That flag is on the hard denylist (`tools.SQLMAP_DENYLIST`) and cannot be passed via `extra_args`, by design. |
+| `sqlmap_scan` returns `BLOQUEADO: flag nao permitida ...` | That flag is not on the allowlist (`tools.sanitize_sqlmap_args`) and cannot be passed via `extra_args`, by design. |
 | `verify_finding` keeps returning `NAO_VERIFICADO`/`NAO_REPRODUZIDO` | Either it's running in dry-run (nothing is sent), the URL is out of scope, or the live response genuinely doesn't match `expected_status`/`expected_substring`. Check with `http_probe` first. |
