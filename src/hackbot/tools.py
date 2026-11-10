@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
+import os
 import re
 import shlex
+import tempfile
 from typing import Any
 
 import httpx
@@ -16,6 +19,7 @@ from .scope_guard import (
     Resolver,
     ScopeViolation,
     Target,
+    authority_of,
     check_target,
     resolve_target,
     system_resolver,
@@ -99,6 +103,116 @@ def sanitize_sqlmap_args(tokens: list[str]) -> list[str]:
             value = str(max(1, min(threads, _SQLMAP_MAX_THREADS)))
         out += [name, value]
     return [*SQLMAP_FORCED, *out]
+
+
+# ffuf: same idea. Go's flag package accepts `-flag` and `--flag` (no prefix
+# abbreviation), so both spellings are normalized to `-flag`. Not allowed:
+# `-u` (target swap), `-x`/`-replay-proxy`, `-request` (raw request with its own
+# Host), `-input-cmd` (runs a command), `-w`/`-input-file`/`-config` (extra
+# inputs), `-o`/`-od`/`-debug-log` (writes files), `-r`/`-recursion` (follows
+# the server off the checked URL), `-sni`, and anything else not listed.
+FFUF_ALLOWED_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"})
+_FFUF_SWITCHES = frozenset({"-ac", "-ic", "-s", "-c", "-v", "-sa", "-se", "-sf"})
+_FFUF_OPTIONS = frozenset({
+    "-H", "-X", "-d", "-b", "-e", "-t", "-p", "-timeout", "-maxtime", "-maxtime-job",
+    "-mc", "-ms", "-mw", "-ml", "-mr", "-mt", "-mmode",
+    "-fc", "-fs", "-fw", "-fl", "-fr", "-ft", "-fmode",
+})
+_FFUF_DROPPED = frozenset({"-rate"})  # forced from scope.max_requests_per_second
+_FFUF_MAX_THREADS = 10
+_FFUF_EXTENSION = re.compile(r"^\.?[A-Za-z0-9_-]{1,16}$")
+
+
+def sanitize_ffuf_args(tokens: list[str], rate: float) -> list[str]:
+    """Valida extra_args do ffuf contra a allowlist. Devolve a lista final com
+    `-noninteractive` e `-rate` (do escopo) forcados."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if not token.startswith("-"):
+            raise ToolArgsDenied(f"argumento posicional nao permitido: {token!r}")
+        name, has_value, value = token.partition("=")
+        if name.startswith("--"):
+            name = name[1:]
+        if name in _FFUF_DROPPED:
+            i += 1 if has_value else 2
+            continue
+        if name in _FFUF_SWITCHES:
+            if has_value:
+                raise ToolArgsDenied(f"{name} nao aceita valor")
+            out.append(name)
+            i += 1
+            continue
+        if name not in _FFUF_OPTIONS:
+            raise ToolArgsDenied(f"flag nao permitida no ffuf: {name}")
+        if not has_value:
+            if i + 1 >= len(tokens):
+                raise ToolArgsDenied(f"{name} precisa de um valor")
+            value = tokens[i + 1]
+            i += 2
+        else:
+            i += 1
+        if not value or value.startswith("-"):
+            raise ToolArgsDenied(f"valor invalido para {name}: {value!r}")
+        if name == "-H" and value.split(":", 1)[0].strip().lower() == "host":
+            raise ToolArgsDenied("cabecalho Host nao pode ser alterado")
+        if name == "-X" and value.upper() not in FFUF_ALLOWED_METHODS:
+            raise ToolArgsDenied(f"metodo nao permitido: {value}")
+        if name == "-e" and not all(_FFUF_EXTENSION.match(e) for e in value.split(",")):
+            raise ToolArgsDenied(f"extensoes invalidas: {value!r}")
+        if name == "-t":
+            try:
+                threads = int(value)
+            except ValueError as exc:
+                raise ToolArgsDenied(f"-t invalido: {value!r}") from exc
+            value = str(max(1, min(threads, _FFUF_MAX_THREADS)))
+        out += [name, value]
+    return ["-noninteractive", "-rate", str(max(1, int(rate))), *out]
+
+
+def ffuf_extensions(args: list[str]) -> list[str]:
+    exts: list[str] = []
+    for name, value in itertools.pairwise(args):
+        if name == "-e":
+            exts += value.split(",")
+    return exts
+
+
+def filter_ffuf_wordlist(
+    url: str, words: list[str], extensions: list[str], scope: TargetScope
+) -> tuple[list[str], int]:
+    """ffuf so ve a URL com FUZZ; cada palavra substituida pode cair num path
+    excluido (`logout`, `../admin/delete`). Mantem so as palavras cujas URLs
+    finais (palavra e palavra+extensao, como o ffuf gera) passam no escopo."""
+    kept: list[str] = []
+    dropped = 0
+    for word in words:
+        variants = [word] + [word + ext for ext in extensions]
+        try:
+            for variant in variants:
+                check_target(Target(url.replace("FUZZ", variant)), scope, 0, 1)
+        except ScopeViolation:
+            dropped += 1
+            continue
+        kept.append(word)
+    return kept, dropped
+
+
+def _write_filtered_wordlist(
+    wordlist: str, url: str, extensions: list[str], scope: TargetScope
+) -> tuple[str | None, int, int]:
+    """Le o wordlist, filtra pelo escopo e grava as palavras mantidas num
+    arquivo temporario. Devolve (caminho_ou_None, mantidas, removidas)."""
+    with open(wordlist, encoding="utf-8", errors="replace") as fh:
+        words = [line.rstrip("\r\n") for line in fh if line.strip()]
+    kept, dropped = filter_ffuf_wordlist(url, words, extensions, scope)
+    if not kept:
+        return None, 0, dropped
+    fd, path = tempfile.mkstemp(prefix="hackbot-ffuf-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(kept) + "\n")
+    return path, len(kept), dropped
 
 
 # --------------------------------------------------------------------------
@@ -528,30 +642,56 @@ def make_tools(
     async def ffuf_scan(url: str, wordlist: str, extra_args: str = "") -> str:
         """Roda ffuf (fuzzing de paths/params) contra o alvo (requer
         PH_ENABLE_EXTERNAL_TOOLS=true e o binario 'ffuf' no PATH). A URL deve
-        conter o marcador FUZZ; se nao conter, ele e anexado ao final do path.
-        Scope-guarded (checado contra a URL com FUZZ), respeita dry_run."""
+        conter o marcador FUZZ no path ou na query; se nao conter, ele e anexado
+        ao final do path. extra_args passa por uma allowlist (-H, -X, -d, -b, -e,
+        -t, filtros -mc/-fc/...); -rate vem do escopo. Antes de rodar, palavras
+        do wordlist que levariam a URLs fora do escopo sao removidas.
+        Scope-guarded, respeita dry_run."""
         if not settings.enable_external_tools:
             return "DESABILITADO: defina PH_ENABLE_EXTERNAL_TOOLS=true para habilitar nuclei/ffuf/sqlmap"
         if "FUZZ" not in url:
             url = url.rstrip("/") + "/FUZZ"
+        if "FUZZ" in authority_of(url) or not url.lower().startswith(("http://", "https://")):
+            return "VIOLACAO: o marcador FUZZ so e permitido no path ou na query"
         violation = await _guard_or_none(url)
         if violation:
             return violation
-        cmd = [settings.ffuf_bin, "-u", url, "-w", wordlist, "-of", "json", "-s"]
-        if extra_args:
-            cmd += shlex.split(extra_args)
-        if settings.dry_run:
-            actions.append(f"DRY ffuf_scan {url}")
-            return f"DRY_RUN: would run `{shlex.join(cmd)}`"
+        if not wordlist or wordlist.startswith("-"):
+            return f"BLOQUEADO: wordlist invalido: {wordlist!r}"
         try:
-            budget.request(1)
-        except BudgetExhausted as exc:
-            return f"BUDGET: {exc}"
-        code, out, err = await _run_subprocess(cmd, settings.external_tool_timeout)
-        actions.append(f"ffuf_scan {url} -> exit={code}")
+            safe_args = sanitize_ffuf_args(
+                shlex.split(extra_args) if extra_args else [], scope.max_requests_per_second
+            )
+        except (ToolArgsDenied, ValueError) as exc:
+            return f"BLOQUEADO: {exc}"
+        if settings.dry_run:
+            cmd = [settings.ffuf_bin, "-u", url, "-w", wordlist, "-of", "json", "-s", *safe_args]
+            actions.append(f"DRY ffuf_scan {url}")
+            return f"DRY_RUN: would run `{shlex.join(cmd)}` (wordlist filtrado pelo escopo)"
+        try:
+            filtered, kept, dropped = await asyncio.to_thread(
+                _write_filtered_wordlist, wordlist, url, ffuf_extensions(safe_args), scope
+            )
+        except OSError as exc:
+            return f"ERRO: nao foi possivel ler o wordlist: {exc}"
+        if filtered is None:
+            return f"VIOLACAO: todas as {dropped} palavras do wordlist caem fora do escopo"
+        try:
+            try:
+                budget.request(1)
+            except BudgetExhausted as exc:
+                return f"BUDGET: {exc}"
+            cmd = [settings.ffuf_bin, "-u", url, "-w", filtered, "-of", "json", "-s", *safe_args]
+            code, out, err = await _run_subprocess(cmd, settings.external_tool_timeout)
+        finally:
+            os.unlink(filtered)
+        actions.append(f"ffuf_scan {url} -> exit={code} ({dropped} palavras fora do escopo removidas)")
         if code == -1:
             return f"ERRO: {err}"
-        return f"ffuf exit={code}\nstdout[:2000]: {out[:2000]}\nstderr[:500]: {err[:500]}"
+        return (
+            f"ffuf exit={code} ({kept} palavras, {dropped} removidas por escopo)\n"
+            f"stdout[:2000]: {out[:2000]}\nstderr[:500]: {err[:500]}"
+        )
 
     @tool
     async def sqlmap_scan(url: str, data: str = "", extra_args: str = "") -> str:

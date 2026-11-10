@@ -91,6 +91,7 @@ These are the guardrails, and none of them can be bypassed by the LLM:
 | **No destructive payloads** | `prompts.SYSTEM_PROMPT` | The agent is instructed never to send `DROP`, `rm -rf`, shutdown, fork bombs, etc., and to prefer reads over writes. |
 | **No wildcard host** | `TargetScope` validator | `allowed_hosts` cannot contain a bare `"*"`. |
 | **External tools gate** | `Settings.enable_external_tools` (default `False`) | `nuclei_scan`/`ffuf_scan`/`sqlmap_scan` refuse to run at all — even in dry-run — until explicitly enabled. A second, independent gate on top of scope/dry-run. |
+| **ffuf allowlist** | `tools.sanitize_ffuf_args`, `tools.filter_ffuf_wordlist` | `extra_args` must only use allowlisted flags (`-H`, `-X` with safe methods, `-d`, `-b`, `-e`, `-t` (max 10), match/filter flags). `-u`, `-x`, `-replay-proxy`, `-request`, `-input-cmd`, `-w`, `-o`, `-r`, `-recursion`, `-sni` or a `Host` header are rejected. `-rate` is forced from `max_requests_per_second`. Each wordlist word (and word+extension) is checked against the scope and dropped if it lands outside it, e.g. on an excluded path. |
 | **sqlmap allowlist** | `tools.sanitize_sqlmap_args` | `extra_args` must only use allowlisted flags (`-p`, `--technique`, `--dbms`, `--cookie`, `--threads` (max 4), ...). Anything else, including `-u`, `-m`, `-g`, `-l`, `--alert`, `--proxy`, `--tamper`, abbreviated flags or a `Host` header, is rejected. `--batch --risk=1 --level=1` are always forced. |
 | **Verified findings** | `verify_finding` tool | Re-executes the HTTP PoC and checks it against an expected status/substring **before** registering anything. A scope violation, dry-run, or mismatch means nothing is saved. |
 
@@ -299,7 +300,7 @@ is empty.
 | `save_finding(title, severity, evidence, url)` | — | — | — | Record an observational finding (no PoC re-check). Severity ∈ `CRITICAL/HIGH/MEDIUM/LOW/INFO`. Stored with `verified: false`. |
 | `verify_finding(title, severity, url, method, expected_status, expected_substring, ...)` | ✅ | ✅ | — | **Re-executes** the HTTP PoC and only registers the finding (`verified: true`) if the response actually matches. Nothing is saved on a scope violation, dry-run, budget cap, or mismatch. |
 | `nuclei_scan(url, templates)` | ✅ | ✅ | ✅ | Run `nuclei` against the target. Requires the binary on `PATH` and `PH_ENABLE_EXTERNAL_TOOLS=true`. |
-| `ffuf_scan(url, wordlist, extra_args)` | ✅ | ✅ | ✅ | Run `ffuf` for path/param fuzzing. Auto-appends the `FUZZ` marker if the URL doesn't already have one. |
+| `ffuf_scan(url, wordlist, extra_args)` | ✅ | ✅ | ✅ | Run `ffuf` for path/param fuzzing. Auto-appends the `FUZZ` marker if the URL doesn't already have one; `FUZZ` is only allowed in the path or query. Words that would produce an out-of-scope URL are removed from the wordlist before `ffuf` runs. |
 | `sqlmap_scan(url, data, extra_args)` | ✅ | ✅ | ✅ | Run `sqlmap` in non-interactive, low-risk mode. `--batch --risk=1 --level=1` are always forced; destructive flags (`--os-shell`, `--file-write`, `--dump-all`, …) are always rejected, even if requested in `extra_args`. |
 | `finish(reason)` | — | — | — | End the loop and trigger the report. |
 

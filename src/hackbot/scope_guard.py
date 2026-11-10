@@ -146,6 +146,12 @@ def normalize_path(raw_path: str) -> str:
     return normalized
 
 
+def authority_of(url: str) -> str:
+    """Trecho `user@host:port` da URL, como texto bruto ('' se nao houver)."""
+    match = _AUTHORITY.match(url)
+    return match.group(1) if match else ""
+
+
 def _excluded_by(path: str, patterns: list[str]) -> str | None:
     """Exclusao sem diferenciar maiusculas e cobrindo tudo abaixo do path
     (`/logout` tambem bloqueia `/logout/`, `/Logout` e `/logout/x`)."""
@@ -191,8 +197,7 @@ def check_target(
     scheme = parsed.scheme.lower()
     if scheme not in DEFAULT_PORTS:
         raise ScopeViolation(f"esquema '{scheme}' nao permitido")
-    authority = _AUTHORITY.match(text)
-    if parsed.userinfo or (authority and "@" in authority.group(1)):
+    if parsed.userinfo or "@" in authority_of(text):
         raise ScopeViolation("URL com credenciais embutidas (user@host) nao e permitida")
 
     host = _normalize_host(parsed.raw_host.decode("ascii", errors="replace"))

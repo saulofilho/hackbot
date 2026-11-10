@@ -1,6 +1,7 @@
 """Regressoes para bypasses do scope guard encontrados ao portar os guardrails
 para o scopehound. Nada aqui toca rede ou DNS reais: resolver e transporte
 sao falsos."""
+import ast
 import ipaddress
 
 import httpx
@@ -356,3 +357,141 @@ async def test_http_client_ignores_proxy_env(monkeypatch):
     async with _new_client(5.0) as client:
         assert client.trust_env is False
         assert not client._mounts  # no proxy transports were mounted from env
+
+
+# ---------------------------------------------------------------------------
+# 7. ffuf: allowlist for extra_args, FUZZ only in path/query, wordlist filter
+# ---------------------------------------------------------------------------
+
+def _ffuf_tools(tmp_path, dry_run=True, **scope_kw):
+    settings = Settings(
+        dry_run=dry_run,
+        require_authorization=False,
+        enable_external_tools=True,
+        ffuf_bin=str(tmp_path / "fake-ffuf"),
+    )
+    budget = Budget(max_steps=50, max_requests=50, max_tokens=100_000)
+    tools = make_tools(
+        settings, _scope(**scope_kw), budget, [], [],
+        resolver=_resolver({"localhost": ["127.0.0.1"], "app.lab": ["93.184.216.34"]}),
+    )
+    return {t.name: t for t in tools}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "-u http://evil.com/FUZZ",
+        "--u=http://evil.com/FUZZ",
+        "-x http://evil.com:8080",
+        "-replay-proxy http://evil.com:8080",
+        "-request req.txt",
+        "-input-cmd id",
+        "-input-file /etc/passwd",
+        "-w /etc/passwd:FUZZ",
+        "-config evil.toml",
+        "-o /tmp/out.json",
+        "-od /tmp",
+        "-debug-log /tmp/x",
+        "-r",
+        "-recursion",
+        "-sni evil.com",
+        "-H Host:evil.com",
+        "-H 'host : evil.com'",
+        "-X DELETE",
+        "-e .php,/../logout",
+        "-t lots",
+        "-ac=false",
+        "positional",
+        "-mc -x",
+    ],
+)
+def test_ffuf_args_outside_allowlist_rejected(extra):
+    import shlex
+
+    from hackbot.tools import ToolArgsDenied, sanitize_ffuf_args
+
+    with pytest.raises(ToolArgsDenied):
+        sanitize_ffuf_args(shlex.split(extra), 5.0)
+
+
+def test_ffuf_allowlisted_args_pass_rate_forced_threads_clamped():
+    from hackbot.tools import sanitize_ffuf_args
+
+    out = sanitize_ffuf_args(
+        ["--mc=200,301", "-fs", "0", "-t", "100", "-rate", "999", "-e", ".php,.bak", "-ac"], 3.0
+    )
+    assert out == [
+        "-noninteractive", "-rate", "3",
+        "-mc", "200,301", "-fs", "0", "-t", "10", "-e", ".php,.bak", "-ac",
+    ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://FUZZ.lab/", "http://app.FUZZ/", "http://localhost:FUZZ/", "http://FUZZ@localhost/"],
+)
+async def test_ffuf_fuzz_marker_outside_path_rejected(tmp_path, url):
+    tools = _ffuf_tools(tmp_path)
+    r = await tools["ffuf_scan"].ainvoke({"url": url, "wordlist": "w.txt"})
+    assert "VIOLACAO" in r
+
+
+async def test_ffuf_tool_blocks_target_override(tmp_path):
+    tools = _ffuf_tools(tmp_path)
+    r = await tools["ffuf_scan"].ainvoke(
+        {"url": "http://localhost/FUZZ", "wordlist": "w.txt", "extra_args": "-u http://evil.com/FUZZ"}
+    )
+    assert "BLOQUEADO" in r
+
+
+def test_filter_ffuf_wordlist_drops_excluded_and_escaping_words():
+    from hackbot.tools import filter_ffuf_wordlist
+
+    words = ["api", "logout", "Logout", "x/../logout", "%6cogout", "admin/delete", "a\\b",
+             "../../logout", "users", "logout;x"]
+    kept, dropped = filter_ffuf_wordlist("http://localhost/FUZZ", words, [], _scope())
+    assert kept == ["api", "users"]
+    assert dropped == len(words) - 2
+    # extensions are checked too: "log" + "out" lands on /logout
+    kept, _ = filter_ffuf_wordlist("http://localhost/FUZZ", ["log", "ok"], ["out"], _scope())
+    assert kept == ["ok"]
+
+
+async def test_ffuf_live_runs_with_filtered_wordlist(tmp_path):
+    import os
+    import sys
+
+    record = tmp_path / "record.txt"
+    fake = tmp_path / "fake-ffuf"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "w = sys.argv[sys.argv.index('-w') + 1]\n"
+        f"open({str(record)!r}, 'w').write(repr(sys.argv[1:]) + '\\n' + open(w).read())\n"
+    )
+    os.chmod(fake, 0o755)
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("api\nlogout\n../../admin/delete\nusers\n\n")
+    tools = _ffuf_tools(tmp_path, dry_run=False)
+    r = await tools["ffuf_scan"].ainvoke(
+        {"url": "http://localhost/FUZZ", "wordlist": str(wordlist), "extra_args": "-mc 200"}
+    )
+    assert "exit=0" in r
+    assert "2 removidas" in r
+    argv_line, *sent_words = record.read_text().splitlines()
+    assert sent_words == ["api", "users"]
+    argv = ast.literal_eval(argv_line)
+    assert argv[argv.index("-u") + 1] == "http://localhost/FUZZ"
+    assert argv[argv.index("-w") + 1] != str(wordlist)  # filtered temp copy
+    assert not os.path.exists(argv[argv.index("-w") + 1])  # and it was cleaned up
+    assert argv[argv.index("-rate") + 1] == "5"  # scope default rps
+
+
+async def test_ffuf_all_words_out_of_scope_runs_nothing(tmp_path):
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("logout\nLOGOUT/\n")
+    tools = _ffuf_tools(tmp_path, dry_run=False)
+    r = await tools["ffuf_scan"].ainvoke({"url": "http://localhost/FUZZ", "wordlist": str(wordlist)})
+    assert "VIOLACAO" in r
+    assert not (tmp_path / "record.txt").exists()
